@@ -143,6 +143,44 @@ class TestFeelLifecycle:
         assert "Feel #3" in feels[0]["content"]
 
     @pytest.mark.asyncio
+    async def test_breath_feel_channel_reachable_without_query(self, isolated_tools, monkeypatch):
+        """Regression: breath(domain='feel') with an EMPTY query must reach the
+        feel channel — not fall through to the empty-query surfacing branch.
+
+        The feel branch ignores query content (it lists all feels by time), so the
+        natural call is breath(domain='feel') with no query. It used to sit AFTER
+        the empty-query surfacing guard, which returns early — making feel
+        unreachable on that path: an empty query returned ordinary memories instead
+        of feels. Feel retrieval needs no LLM, so this runs without an API key.
+
+        This test drives the real breath() entrypoint (existing feel tests only
+        exercise bucket_manager sorting), which is why the branch-order bug slipped
+        through originally.
+        """
+        bm, dh, de, bd = isolated_tools
+        import server
+        monkeypatch.setattr(server, "bucket_mgr", bm)
+        monkeypatch.setattr(server, "decay_engine", de)
+        breath = getattr(server.breath, "fn", server.breath)
+
+        await bm.create(
+            content="今天修好了 feel 通道，心里很踏实。",
+            tags=[], importance=5, domain=[], valence=0.8, arousal=0.4,
+            name=None, bucket_type="feel",
+        )
+        await bm.create(
+            content="普通动态记忆：记得买牛奶。",
+            tags=[], importance=5, domain=["杂事"], valence=0.5, arousal=0.3,
+            name="买牛奶", bucket_type="dynamic",
+        )
+
+        out = await breath(query="", domain="feel")
+
+        assert "=== 你留下的 feel ===" in out   # reached the feel channel, not surfacing
+        assert "feel 通道" in out               # feel content present
+        assert "买牛奶" not in out               # ordinary memory absent from feel channel
+
+    @pytest.mark.asyncio
     async def test_source_bucket_marked_digested(self, isolated_tools):
         """hold(feel=True, source_bucket=X) marks X as digested."""
         bm, dh, de, bd = isolated_tools
