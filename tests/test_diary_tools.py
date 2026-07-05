@@ -158,3 +158,24 @@ async def test_diary_read_date_falls_back_to_legacy_buckets(isolated_server):
 
     assert "[legacy_date:2026-06-25]" in out
     assert "同事关系记录" in out
+
+
+@pytest.mark.asyncio
+async def test_bucket_read_returns_exact_bucket_content(isolated_server):
+    bucket_read = getattr(isolated_server.bucket_read, "fn", isolated_server.bucket_read)
+    bucket_id = await isolated_server.bucket_mgr.create(
+        content="exact bucket body for direct read",
+        tags=["direct-read"],
+        importance=7,
+        domain=["work"],
+        valence=0.5,
+        arousal=0.3,
+        name="direct read fixture",
+        event_time="2026-06-25",
+    )
+
+    out = await bucket_read(bucket_id=bucket_id)
+
+    assert f"[bucket_id:{bucket_id}]" in out
+    assert "direct read fixture" in out
+    assert "exact bucket body for direct read" in out

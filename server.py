@@ -1175,6 +1175,35 @@ async def diary_read(diary_id: str = "", title: str = "", date: str = "") -> str
     return header + "\n" + str(d.get("content", ""))
 
 
+@mcp.tool()
+async def bucket_read(bucket_id: str) -> str:
+    """Read one memory bucket by exact bucket_id, including its metadata and full content."""
+    wanted = str(bucket_id or "").strip()
+    if not wanted:
+        return "请提供有效的 bucket_id。"
+
+    bucket = await bucket_mgr.get(wanted)
+    if not bucket:
+        return f"未找到记忆桶: {wanted}"
+
+    meta = bucket.get("metadata", {}) or {}
+    tags = ", ".join(meta.get("tags", []) or [])
+    domains = ", ".join(meta.get("domain", []) or [])
+    header = (
+        f"[bucket_id:{bucket.get('id', wanted)}]\n"
+        f"name: {meta.get('name', '')}\n"
+        f"event_time: {meta.get('event_time', '')}\n"
+        f"created: {meta.get('created', '')}\n"
+        f"domain: {domains}\n"
+        f"tags: {tags}\n"
+        f"importance: {meta.get('importance', '')}\n"
+        f"resolved: {meta.get('resolved', False)}\n"
+        f"internalized: {meta.get('internalized', False)}\n"
+        f"---"
+    )
+    return header + "\n" + strip_wikilinks(str(bucket.get("content", "")).strip())
+
+
 # =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
