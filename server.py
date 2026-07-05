@@ -115,6 +115,70 @@ def _date_part(value: str) -> str:
     return str(value or "")[:10]
 
 
+def _normalize_date_query(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parts = raw.replace("/", "-").replace(".", "-").split("-")
+    if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+        year, month, day = parts[:3]
+        if len(year) == 4:
+            return f"{year}-{int(month):02d}-{int(day):02d}"
+    return _date_part(raw)
+
+
+def _bucket_search_text(bucket: dict) -> str:
+    meta = bucket.get("metadata", {}) or {}
+    pieces = [
+        bucket.get("id", ""),
+        meta.get("name", ""),
+        " ".join(meta.get("domain", []) or []),
+        " ".join(meta.get("tags", []) or []),
+        meta.get("summary", ""),
+        meta.get("event_time", ""),
+        meta.get("created", ""),
+        bucket.get("content", ""),
+    ]
+    return "\n".join(str(p) for p in pieces if p is not None).lower()
+
+
+async def _literal_bucket_search(
+    query: str,
+    limit: int = 20,
+    domain_filter: list[str] | None = None,
+) -> list[dict]:
+    needles = [str(query or "").strip().lower()]
+    normalized_date = _normalize_date_query(query)
+    if normalized_date and normalized_date.lower() not in needles:
+        needles.append(normalized_date.lower())
+    needles = [n for n in needles if n]
+    if not needles:
+        return []
+
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    results = []
+    for b in all_buckets:
+        meta = b.get("metadata", {}) or {}
+        if domain_filter:
+            domains = {str(d).lower() for d in (meta.get("domain", []) or [])}
+            if not any(str(d).lower() in domains for d in domain_filter):
+                continue
+        haystack = _bucket_search_text(b)
+        if any(n in haystack for n in needles):
+            b = dict(b)
+            b["score"] = 100.0
+            b["literal_match"] = True
+            results.append(b)
+    results.sort(
+        key=lambda b: (
+            str((b.get("metadata") or {}).get("event_time") or (b.get("metadata") or {}).get("created") or ""),
+            int((b.get("metadata") or {}).get("importance", 5)),
+        ),
+        reverse=True,
+    )
+    return results[:limit]
+
+
 def _infer_diary_title(content: str, event_time: str = "", title: str = "") -> str:
     if title and title.strip():
         return title.strip()[:120]
@@ -660,6 +724,19 @@ async def breath(
                if not (is_internalized(b["metadata"])
                        or _is_noise(b["metadata"])
                        or b["metadata"].get("type") == "feel")]
+    if not matches:
+        try:
+            matches = await _literal_bucket_search(
+                query,
+                limit=max(max_results, 20),
+                domain_filter=domain_filter,
+            )
+            matches = [b for b in matches
+                       if not (is_internalized(b["metadata"])
+                               or _is_noise(b["metadata"])
+                               or b["metadata"].get("type") == "feel")]
+        except Exception as e:
+            logger.warning(f"Literal fallback search failed / 字面兜底检索失败: {e}")
 
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
@@ -705,6 +782,8 @@ async def breath(
             await bucket_mgr.touch(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+            elif bucket.get("literal_match"):
+                summary = f"[字面命中] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
@@ -1005,9 +1084,9 @@ async def diary_list(
         return "暂无日记索引。"
 
     q = title_query.strip().lower()
-    exact_date = _date_part(date.strip()) if date.strip() else ""
-    start = _date_part(date_from.strip()) if date_from.strip() else ""
-    end = _date_part(date_to.strip()) if date_to.strip() else ""
+    exact_date = _normalize_date_query(date) if date.strip() else ""
+    start = _normalize_date_query(date_from) if date_from.strip() else ""
+    end = _normalize_date_query(date_to) if date_to.strip() else ""
 
     def keep(d: dict) -> bool:
         d_date = _date_part(d.get("event_date") or d.get("event_time") or d.get("created_at"))
@@ -1045,12 +1124,12 @@ async def diary_list(
 async def diary_read(diary_id: str = "", title: str = "", date: str = "") -> str:
     """按 diary_id、标题或日期读取 grow 保存的整篇日记原文。优先 diary_id,其次 title,最后 date(YYYY-MM-DD)。"""
     diaries = _load_diary_index()
-    if not diaries:
+    if not diaries and not date.strip():
         return "暂无日记索引。"
 
     wanted_id = diary_id.strip()
     wanted_title = title.strip().lower()
-    wanted_date = _date_part(date.strip()) if date.strip() else ""
+    wanted_date = _normalize_date_query(date) if date.strip() else ""
     matches = []
     for d in diaries:
         if wanted_id and d.get("diary_id") == wanted_id:
@@ -1062,6 +1141,26 @@ async def diary_read(diary_id: str = "", title: str = "", date: str = "") -> str
             matches.append(d)
 
     if not matches:
+        if wanted_date:
+            legacy = await _literal_bucket_search(wanted_date, limit=50)
+            legacy = [
+                b for b in legacy
+                if not is_internalized(b.get("metadata", {}))
+                and b.get("metadata", {}).get("type") != "feel"
+            ]
+            if legacy:
+                lines = [
+                    f"[legacy_date:{wanted_date}] 未找到整篇日记索引；以下是旧版 grow/hold 已拆出的当天相关记忆桶。"
+                ]
+                for b in legacy:
+                    meta = b.get("metadata", {}) or {}
+                    title_text = meta.get("name") or b.get("id")
+                    when = meta.get("event_time") or meta.get("created") or ""
+                    lines.append(
+                        f"[bucket_id:{b.get('id')}] {when} 《{title_text}》\n"
+                        f"{strip_wikilinks(str(b.get('content', '')).strip())}"
+                    )
+                return "\n---\n".join(lines)
         return "未找到匹配日记。"
     matches.sort(key=lambda d: (d.get("event_date", ""), d.get("created_at", "")), reverse=True)
     d = matches[0]

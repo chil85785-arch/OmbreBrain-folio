@@ -28,6 +28,9 @@ class FakeDehydrator:
     async def merge(self, old_content, new_content):
         return old_content + "\n" + new_content
 
+    async def dehydrate(self, content, metadata):
+        return content
+
 
 class FakeDecayEngine:
     is_running = False
@@ -112,3 +115,46 @@ async def test_trace_allows_safe_user_metadata_but_blocks_destructive(isolated_s
 
     delete_blocked = await trace(bucket_id=bucket_id, delete=True)
     assert "不能由 AI 删除" in delete_blocked
+
+
+@pytest.mark.asyncio
+async def test_breath_literal_fallback_finds_tags(isolated_server):
+    breath = getattr(isolated_server.breath, "fn", isolated_server.breath)
+    await isolated_server.bucket_mgr.create(
+        content="今天记录了办公室里几位同事之间的互动。",
+        tags=["同事关系", "Sandy", "Ivanka"],
+        importance=8,
+        domain=["work"],
+        valence=0.5,
+        arousal=0.3,
+        name="工作与生活全记录",
+        event_time="2026-06-25",
+    )
+    async def empty_search(*args, **kwargs):
+        return []
+    isolated_server.bucket_mgr.search = empty_search
+
+    out = await breath(query="同事关系", max_results=5, max_tokens=3000)
+
+    assert "[字面命中]" in out
+    assert "同事" in out
+
+
+@pytest.mark.asyncio
+async def test_diary_read_date_falls_back_to_legacy_buckets(isolated_server):
+    diary_read = getattr(isolated_server.diary_read, "fn", isolated_server.diary_read)
+    await isolated_server.bucket_mgr.create(
+        content="旧版 grow 只留下了拆分后的 6 月 25 日同事关系记录。",
+        tags=["同事关系"],
+        importance=8,
+        domain=["work"],
+        valence=0.5,
+        arousal=0.3,
+        name="6.25 工作记录",
+        event_time="2026-06-25",
+    )
+
+    out = await diary_read(date="2026.6.25")
+
+    assert "[legacy_date:2026-06-25]" in out
+    assert "同事关系记录" in out
