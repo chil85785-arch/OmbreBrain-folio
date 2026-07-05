@@ -10,14 +10,16 @@
 # 核心职责：
 #   - Initialize config, bucket manager, dehydrator, decay engine
 #     初始化配置、记忆桶管理器、脱水器、衰减引擎
-#   - Expose 5 MCP tools:
-#     暴露 5 个 MCP 工具：
+#   - Expose MCP tools:
+#     暴露 MCP 工具：
 #       breath — Surface unresolved memories or search by keyword
 #                浮现未解决记忆 或 按关键词检索
 #       hold   — Store a single memory
 #                存储单条记忆
 #       grow   — Diary digest, auto-split into multiple buckets
 #                日记归档，自动拆分多桶
+#       diary_list / diary_read
+#                按标题/日期列出或读取 grow 保存的整篇日记原文
 #       trace  — Modify metadata / resolved / delete
 #                修改元数据 / resolved 标记 / 删除
 #       pulse  — System status + bucket listing
@@ -36,6 +38,8 @@ import time
 import random
 import logging
 import asyncio
+import json
+import uuid
 import httpx
 
 
@@ -75,6 +79,82 @@ _BUCKETS_CACHE_TTL = 15.0  # 秒
 def _invalidate_buckets_cache():
     _BUCKETS_CACHE["ts"] = 0.0
     _BUCKETS_CACHE["payload"] = None
+
+
+def _diary_index_path() -> str:
+    return os.path.join(config.get("buckets_dir", "./buckets"), "diaries.json")
+
+
+def _load_diary_index() -> list[dict]:
+    path = _diary_index_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load diary index: {e}")
+        return []
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    if isinstance(data, dict) and isinstance(data.get("diaries"), list):
+        return [d for d in data["diaries"] if isinstance(d, dict)]
+    return []
+
+
+def _save_diary_index(diaries: list[dict]) -> None:
+    path = _diary_index_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(diaries, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def _date_part(value: str) -> str:
+    return str(value or "")[:10]
+
+
+def _infer_diary_title(content: str, event_time: str = "", title: str = "") -> str:
+    if title and title.strip():
+        return title.strip()[:120]
+    for line in str(content or "").splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line[:120]
+    return f"Diary {(_date_part(event_time) or _date_part(time.strftime('%Y-%m-%d')))}"
+
+
+def _record_diary_entry(
+    *,
+    content: str,
+    event_time: str = "",
+    title: str = "",
+    bucket_ids: list[str] | None = None,
+    item_count: int = 0,
+    created_count: int = 0,
+    merged_count: int = 0,
+) -> dict:
+    from utils import normalize_event_time
+
+    normalized_event_time = normalize_event_time(event_time) if event_time else ""
+    event_date = _date_part(normalized_event_time) or _date_part(time.strftime("%Y-%m-%d"))
+    entry = {
+        "diary_id": uuid.uuid4().hex[:12],
+        "title": _infer_diary_title(content, event_date, title),
+        "event_date": event_date,
+        "event_time": normalized_event_time,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "content": content,
+        "bucket_ids": list(dict.fromkeys(bucket_ids or [])),
+        "item_count": item_count,
+        "created_count": created_count,
+        "merged_count": merged_count,
+    }
+    diaries = _load_diary_index()
+    diaries.append(entry)
+    _save_diary_index(diaries)
+    return entry
 
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
@@ -258,6 +338,7 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     event_time: str = None,
+    return_id: bool = False,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -305,7 +386,7 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                return (bucket["id"] if return_id else bucket["metadata"].get("name", bucket["id"])), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -779,8 +860,8 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str, event_time: str = "") -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=这篇日记记录的事件发生时间(YYYY-MM-DD 或 ISO),不传默认就是现在。整篇日记拆出的所有桶会共享这个 event_time(因为本来就是"那天发生的事")。"""
+async def grow(content: str, event_time: str = "", title: str = "") -> str:
+    """日记归档,自动拆分为多桶。title=可选日记标题。event_time=这篇日记记录的事件发生时间(YYYY-MM-DD 或 ISO),不传默认就是现在。整篇日记拆出的所有桶会共享这个 event_time,并额外保存日记索引供 diary_read 按标题/日期读取原文。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -810,9 +891,19 @@ async def grow(content: str, event_time: str = "") -> str:
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             event_time=event_time or None,
+            return_id=True,
+        )
+        diary = _record_diary_entry(
+            content=content.strip(),
+            event_time=event_time,
+            title=title,
+            bucket_ids=[result_name],
+            item_count=1,
+            created_count=0 if is_merged else 1,
+            merged_count=1 if is_merged else 0,
         )
         action = "合并" if is_merged else "新建"
-        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        return f"{action} → {result_name} | diary_id:{diary['diary_id']} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
@@ -840,10 +931,21 @@ async def grow(content: str, event_time: str = "") -> str:
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             event_time=event_time or None,
+            return_id=True,
         )
-        return f"⚠ 自动拆分失败,已【整段存为一条】记忆(未拆分,内容没丢)→ {result_name}"
+        diary = _record_diary_entry(
+            content=content.strip(),
+            event_time=event_time,
+            title=title,
+            bucket_ids=[result_name],
+            item_count=1,
+            created_count=0 if _is_merged else 1,
+            merged_count=1 if _is_merged else 0,
+        )
+        return f"⚠ 自动拆分失败,已【整段存为一条】记忆(未拆分,内容没丢)→ {result_name} | diary_id:{diary['diary_id']}"
 
     results = []
+    bucket_ids = []
     created = 0
     merged = 0
 
@@ -860,7 +962,9 @@ async def grow(content: str, event_time: str = "") -> str:
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
                 event_time=event_time or None,
+                return_id=True,
             )
+            bucket_ids.append(result_name)
 
             if is_merged:
                 results.append(f"📎{result_name}")
@@ -875,7 +979,101 @@ async def grow(content: str, event_time: str = "") -> str:
             )
             results.append(f"⚠️{item.get('name', '?')}")
 
-    return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
+    diary = _record_diary_entry(
+        content=content.strip(),
+        event_time=event_time,
+        title=title,
+        bucket_ids=bucket_ids,
+        item_count=len(items),
+        created_count=created,
+        merged_count=merged,
+    )
+    return f"{len(items)}条|新{created}合{merged}|diary_id:{diary['diary_id']}\n" + "\n".join(results)
+
+
+@mcp.tool()
+async def diary_list(
+    date: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    title_query: str = "",
+    limit: int = 20,
+) -> str:
+    """按日期或标题列出 grow 保存的日记索引。date=精确日期(YYYY-MM-DD),title_query=标题关键词,date_from/date_to=日期范围。"""
+    diaries = _load_diary_index()
+    if not diaries:
+        return "暂无日记索引。"
+
+    q = title_query.strip().lower()
+    exact_date = _date_part(date.strip()) if date.strip() else ""
+    start = _date_part(date_from.strip()) if date_from.strip() else ""
+    end = _date_part(date_to.strip()) if date_to.strip() else ""
+
+    def keep(d: dict) -> bool:
+        d_date = _date_part(d.get("event_date") or d.get("event_time") or d.get("created_at"))
+        if exact_date and d_date != exact_date:
+            return False
+        if start and d_date < start:
+            return False
+        if end and d_date > end:
+            return False
+        if q and q not in str(d.get("title", "")).lower():
+            return False
+        return True
+
+    try:
+        n = max(1, min(100, int(limit)))
+    except Exception:
+        n = 20
+    matches = [d for d in diaries if keep(d)]
+    matches.sort(key=lambda d: (d.get("event_date", ""), d.get("created_at", "")), reverse=True)
+    if not matches:
+        return "未找到匹配日记。"
+
+    lines = []
+    for d in matches[:n]:
+        bucket_ids = d.get("bucket_ids") or []
+        summary = strip_wikilinks(str(d.get("content", "")).strip()).replace("\n", " ")[:120]
+        lines.append(
+            f"[diary_id:{d.get('diary_id')}] {d.get('event_date', '')} 《{d.get('title', '')}》 "
+            f"buckets:{len(bucket_ids)} items:{d.get('item_count', 0)}\n{summary}"
+        )
+    return "\n---\n".join(lines)
+
+
+@mcp.tool()
+async def diary_read(diary_id: str = "", title: str = "", date: str = "") -> str:
+    """按 diary_id、标题或日期读取 grow 保存的整篇日记原文。优先 diary_id,其次 title,最后 date(YYYY-MM-DD)。"""
+    diaries = _load_diary_index()
+    if not diaries:
+        return "暂无日记索引。"
+
+    wanted_id = diary_id.strip()
+    wanted_title = title.strip().lower()
+    wanted_date = _date_part(date.strip()) if date.strip() else ""
+    matches = []
+    for d in diaries:
+        if wanted_id and d.get("diary_id") == wanted_id:
+            matches = [d]
+            break
+        if wanted_title and wanted_title in str(d.get("title", "")).lower():
+            matches.append(d)
+        elif wanted_date and _date_part(d.get("event_date") or d.get("event_time") or d.get("created_at")) == wanted_date:
+            matches.append(d)
+
+    if not matches:
+        return "未找到匹配日记。"
+    matches.sort(key=lambda d: (d.get("event_date", ""), d.get("created_at", "")), reverse=True)
+    d = matches[0]
+    bucket_ids = ", ".join(d.get("bucket_ids") or [])
+    header = (
+        f"[diary_id:{d.get('diary_id')}]\n"
+        f"title: {d.get('title', '')}\n"
+        f"date: {d.get('event_date', '')}\n"
+        f"bucket_ids: {bucket_ids}\n"
+        f"---"
+    )
+    return header + "\n" + str(d.get("content", ""))
 
 
 # =============================================================
@@ -908,16 +1106,16 @@ async def trace(
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
-    # --- 闸门:用户手写的桶,AI 没权限改/删/归档 ---
-    # --- created_by="user" 是 dashboard 新建桶时打的标记,代表"这是用户手写的事实",
-    #     你只能引用,不能改写 / 删除 / 归档。需要修改请告诉用户去 dashboard 改 ---
+    # --- Gate for dashboard-created buckets. Safe metadata edits are allowed,
+    # but destructive changes still require the dashboard.
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
-    if bucket.get("metadata", {}).get("created_by") == "user":
+    is_user_bucket = bucket.get("metadata", {}).get("created_by") == "user"
+    if is_user_bucket and delete:
         return (
-            f"记忆桶 {bucket_id} 是用户手动写入的,你没有权限修改/删除/归档,"
-            f"只能引用。如有需要,告诉用户去 dashboard 调整。"
+            f"记忆桶 {bucket_id} 是用户手动写入的,不能由 AI 删除。"
+            f"如有需要,请去 dashboard 调整。"
         )
 
     # --- Delete mode / 删除模式 ---
@@ -969,6 +1167,16 @@ async def trace(
 
     if not updates:
         return "没有任何字段需要修改。"
+
+    if is_user_bucket:
+        safe_user_fields = {"name", "domain", "tags", "valence", "arousal", "event_time"}
+        blocked = sorted(k for k in updates if k not in safe_user_fields)
+        if blocked:
+            return (
+                f"记忆桶 {bucket_id} 是用户手动写入的。"
+                f"已保护正文/删除/归档/隐藏/置顶等高风险操作,被拦截字段: {', '.join(blocked)}。"
+                f"可由 AI 修改的字段: name, domain, tags, valence, arousal, event_time。"
+            )
 
     success = await bucket_mgr.update(bucket_id, **updates)
     if not success:
